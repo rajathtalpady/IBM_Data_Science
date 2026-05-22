@@ -1,98 +1,46 @@
-# EMS Complete API Flow with All Layers
+# EMS Complete API Flow - User to Database and Back
 
-This guide shows two complete end-to-end flows: **Register** and **Login + Protected Request**, tracing through every layer from frontend UI through router → controller → repository → MongoDB and back.
+This guide shows the **complete round-trip**: how a request goes from the user through every backend layer to MongoDB, and then **returns back through all layers to the user's screen**.
 
 ---
 
-## 🔐 Complete Login Flow (Router → Controller → Repository → MongoDB)
+## 🔐 Complete Login Flow (Start → End)
 
-### Why the user sends this request
+### **OUTGOING: User → Backend → Database**
 
-The user has credentials and wants to prove their identity. Backend returns a JWT token that proves authentication for future requests.
-
-### Frontend: User enters credentials and submits
+#### 1. Frontend: User enters credentials
 
 **File:** `frontend/src/pages/Login.tsx`
 
 ```tsx
-import { useState } from 'react'
-import { AuthService } from '../services/authService'
-import { useAuth } from '../context/AuthContext'
-import { useNavigate } from 'react-router-dom'
-
 function Login() {
-    const [email, setEmail] = useState('')
-    const [password, setPassword] = useState('')
-    const [error, setError] = useState('')
-    
-    const { login } = useAuth()  // From AuthContext - stores token in localStorage
-    const navigate = useNavigate()
-
     const handleSubmit = async (e: React.FormEvent) => {
-        e.preventDefault()
-        try {
-            // STEP 1: Send credentials to backend via AuthService
-            const data = await AuthService.login(email, password)
-            
-            // STEP 2: Backend returns JWT token
-            // STEP 3: Save token to localStorage and React state (AuthContext)
-            login(data.access_token)
-            
-            // STEP 4: Redirect to employees page (user is authenticated)
-            navigate('/employees')
-        } catch (err: any) {
-            setError('Invalid email or password')
-        }
+        // User clicked "Login" button
+        // STEP 1: Send email and password to backend
+        const data = await AuthService.login(email, password)
     }
-
-    return (
-        <form onSubmit={handleSubmit}>
-            <input 
-                type="email" 
-                placeholder="Email" 
-                value={email} 
-                onChange={e => setEmail(e.target.value)}
-            />
-            <input 
-                type="password" 
-                placeholder="Password" 
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-            />
-            <button type="submit">Login</button>
-            {error && <p style={{color: 'red'}}>{error}</p>}
-        </form>
-    )
 }
 ```
 
-### Frontend: AuthService calls API
+#### 2. Frontend: AuthService makes HTTP request
 
 **File:** `frontend/src/services/authService.ts`
 
 ```typescript
-import api from '../api/axios'
-
-export interface LoginResponse {
-    access_token: string
-    token_type: string
-}
-
 export const AuthService = {
     login: (email: string, password: string): Promise<LoginResponse> => {
-        // Uses shared axios instance (which auto-adds Authorization header)
+        // STEP 2: POST request to backend
         return api.post<LoginResponse>('/auth/login', { email, password })
             .then(r => r.data)
     }
 }
 ```
 
-**HTTP Request Sent to Backend:**
+**HTTP Request leaves browser:**
 
 ```http
 POST http://localhost:8000/auth/login
 Content-Type: application/json
-Accept: application/json
 
 {
   "email": "admin@company.com",
@@ -100,632 +48,336 @@ Accept: application/json
 }
 ```
 
-### Backend: Router receives and validates
+#### 3. Backend Router receives request
 
 **File:** `backend/app/router/auth.py`
 
 ```python
-from fastapi import APIRouter, Depends, status
-from app.models.users import LoginRequest, LoginResponse
-from app.controller.auth import AuthController
-from app.dependencies.users import get_auth_controller
-
-router = APIRouter(prefix="/auth", tags=["auth"])
-
-@router.post(
-    "/login",
-    status_code=status.HTTP_200_OK,
-    response_model=LoginResponse
-)
+@router.post("/login", response_model=LoginResponse)
 async def login_user(
-    payload: LoginRequest,  # ← FastAPI validates JSON against this model
-    controller: AuthController = Depends(get_auth_controller)  # ← Inject controller
+    payload: LoginRequest,  # FastAPI validates JSON here
+    controller: AuthController = Depends(get_auth_controller)
 ) -> LoginResponse:
-    """
-    FastAPI validates request:
-    1. Email field exists and is EmailStr format
-    2. Password field exists and is non-empty string
-    3. If invalid → 422 Unprocessable Entity
-    
-    Then calls controller with validated data
-    """
+    # STEP 3: Router passes validated data to controller
     return await controller.login_user(payload)
 ```
 
-**Request validation (Pydantic model):**
-
-```python
-from pydantic import BaseModel, EmailStr
-
-class LoginRequest(BaseModel):
-    email: EmailStr  # Must be valid email format
-    password: str    # Must be non-empty
-```
-
-### Backend: Controller implements business logic
+#### 4. Backend Controller processes logic
 
 **File:** `backend/app/controller/auth.py`
 
 ```python
-from app.repository.users import UserRepository
-from app.auth.utils import verify_password, create_access_token
-from app.models.users import LoginRequest, LoginResponse, ActivityLogEntry
-from datetime import datetime, timezone
-from fastapi import HTTPException, status
-
-class AuthController:
-    def __init__(self, user_repo: UserRepository):
-        self.user_repo = user_repo  # Injected, not created here
-
-    async def login_user(self, payload: LoginRequest) -> LoginResponse:
-        """
-        Login business logic:
-        1. Find user in database by email
-        2. Verify password matches the hash
-        3. Log the login action
-        4. Generate JWT token
-        5. Return token to frontend
-        """
-        
-        # STEP 1: Query repository to find user by email
-        user = await self.user_repo.find_user_by_email(payload.email)
-        
-        # STEP 2: Check if user exists AND password is correct
-        # IMPORTANT: Use constant-time comparison to prevent timing attacks
-        if not user or not verify_password(payload.password, user.hashed_password):
-            # Generic error message - don't reveal if email exists or password wrong
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-        
-        # STEP 3: Log this login for audit trail
-        await self.user_repo.append_activity_log(
-            user.email,
-            ActivityLogEntry(
-                action="login",
-                timestamp=datetime.now(timezone.utc)
-            )
-        )
-        
-        # STEP 4: Create JWT token with user's email and role
-        token = create_access_token(email=user.email, role=user.role)
-        
-        # STEP 5: Return token to frontend
-        return LoginResponse(access_token=token, token_type="bearer")
+async def login_user(self, payload: LoginRequest) -> LoginResponse:
+    # STEP 4a: Call repository to find user by email
+    user = await self.user_repo.find_user_by_email(payload.email)
+    
+    # STEP 4b: Verify password
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    # STEP 4c: Log login action
+    await self.user_repo.append_activity_log(user.email, ActivityLogEntry(...))
+    
+    # STEP 4d: Create JWT token
+    token = create_access_token(email=user.email, role=user.role)
+    
+    # STEP 4e: Return response object (not HTTP response yet)
+    return LoginResponse(access_token=token, token_type="bearer")
 ```
 
-### Backend: Repository queries database
+#### 5. Backend Repository queries database
 
 **File:** `backend/app/repository/users.py`
 
 ```python
-from motor.motor_asyncio import AsyncIOMotorDatabase
-from app.models.users import UserInDB
-
-class UserRepository:
-    def __init__(self, db: AsyncIOMotorDatabase):
-        self.collection = db["users"]  # MongoDB collection handle
-
-    async def find_user_by_email(self, email: str) -> UserInDB | None:
-        """
-        Query MongoDB for a user by email.
-        
-        This is called by controller.login_user() to find the user
-        before password verification.
-        """
-        
-        # MongoDB query: find_one({email})
-        user_data = await self.collection.find_one({"email": email})
-        
-        # If no match found, return None
-        if user_data is None:
-            return None
-        
-        # Convert MongoDB _id (ObjectId) to string
-        user_data["id"] = str(user_data["_id"])
-        
-        # Construct UserInDB Pydantic model from database document
-        return UserInDB(**user_data)
-
-    async def append_activity_log(self, email: str, entry: ActivityLogEntry) -> None:
-        """
-        Add a new activity log entry to user's activity log array.
-        
-        Called by controller after successful login to record the action.
-        """
-        
-        # MongoDB update: append to activity_log array
-        await self.collection.update_one(
-            {"email": email},
-            {"$push": {"activity_log": entry.model_dump()}}
-        )
+async def find_user_by_email(self, email: str) -> UserInDB | None:
+    # STEP 5a: Query MongoDB for user by email
+    user_data = await self.collection.find_one({"email": email})
+    
+    # STEP 5b: Return user document or None
+    if user_data is None:
+        return None
+    
+    user_data["id"] = str(user_data["_id"])
+    return UserInDB(**user_data)
 ```
 
-### Backend: MongoDB operations
+#### 6. MongoDB executes query
 
 ```javascript
-// Step 1: Find user by email
+// STEP 6: MongoDB queries its collection
 db.users.findOne({ email: "admin@company.com" })
 
-// Returns this document (if found):
+// Returns document:
 {
   "_id": ObjectId("507f1f77bcf86cd799439011"),
   "email": "admin@company.com",
   "hashed_password": "$argon2id$v=19$m=65540,t=3,p=4$...",
   "role": "admin",
-  "activity_log": [
-    {
-      "action": "register",
-      "timestamp": ISODate("2026-05-20T08:00:00Z")
-    }
-  ]
+  "activity_log": [...]
 }
-
-// Step 2: After password verification, append login event
-db.users.updateOne(
-  { email: "admin@company.com" },
-  {
-    $push: {
-      activity_log: {
-        action: "login",
-        timestamp: ISODate("2026-05-22T14:30:00Z")
-      }
-    }
-  }
-)
-
-// Now activity_log has two entries
-```
-
-### Backend: JWT Token Creation
-
-**File:** `backend/app/auth/utils.py`
-
-```python
-from jose import jwt
-from datetime import datetime, timedelta, timezone
-from app.core.settings import settings
-
-def create_access_token(email: str, role: str) -> str:
-    """
-    Create signed JWT token containing user info.
-    
-    Token payload includes:
-    - sub: email (subject - who the token is for)
-    - role: admin or user
-    - iat: issued at timestamp
-    - exp: expiration timestamp
-    
-    Signature proves token hasn't been tampered with.
-    """
-    
-    # Calculate expiration: now + 30 minutes
-    now = datetime.now(timezone.utc)
-    expire = now + timedelta(minutes=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    # Create payload dict
-    payload = {
-        "sub": email,
-        "role": role,
-        "iat": now,
-        "exp": expire
-    }
-    
-    # Sign with secret key using HS256 algorithm
-    # Only server with secret key can create valid tokens
-    token = jwt.encode(
-        payload,
-        settings.JWT_SECRET_KEY,
-        algorithm=settings.JWT_ALGORITHM
-    )
-    
-    return token
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """
-    Verify plain password matches the Argon2 hash.
-    
-    Uses constant-time comparison to prevent timing attacks.
-    """
-    from passlib.context import CryptContext
-    pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
-    return pwd_context.verify(plain_password, hashed_password)
-```
-
-**Example JWT Token:**
-
-```
-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.
-eyJzdWIiOiJhZG1pbkBjb21wYW55LmNvbSIsInJvbGUiOiJhZG1pbiIsImlhdCI6MTcxNjQwMjIwMCwiZXhwIjoxNzE2NDA0MDAwfQ.
-abcdef123456xyz789...
-
-DECODED:
-Header: { "alg": "HS256", "typ": "JWT" }
-Payload: {
-  "sub": "admin@company.com",
-  "role": "admin",
-  "iat": 1716402200,
-  "exp": 1716404000
-}
-Signature: HMACSHA256(Header.Payload, "your-secret-key")
-```
-
-### Frontend: Store token and redirect
-
-**File:** `frontend/src/context/AuthContext.tsx`
-
-```typescript
-import { createContext, useContext, useState } from 'react'
-
-interface AuthContextType {
-    token: string | null
-    login: (newToken: string) => void
-    logout: () => void
-}
-
-const AuthContext = createContext<AuthContextType>({} as AuthContextType)
-
-export function AuthProvider({ children }: { children: ReactNode }) {
-    // Initialize from localStorage so session persists on page refresh
-    const [token, setToken] = useState(localStorage.getItem('token'))
-
-    // Called by Login page after successful authentication
-    const login = (newToken: string) => {
-        // Save to localStorage (survives page refresh)
-        localStorage.setItem('token', newToken)
-        // Update React state (immediate UI updates)
-        setToken(newToken)
-    }
-
-    const logout = () => {
-        localStorage.removeItem('token')
-        setToken(null)
-    }
-
-    return (
-        <AuthContext.Provider value={{ token, login, logout }}>
-            {children}
-        </AuthContext.Provider>
-    )
-}
-
-export const useAuth = () => useContext(AuthContext)
-```
-
-**Backend Response:**
-
-```http
-HTTP/1.1 200 OK
-Content-Type: application/json
-
-{
-  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBjb21wYW55LmNvbSIsInJvbGUiOiJhZG1pbiJ9...",
-  "token_type": "bearer"
-}
-```
-
-**Frontend Storage:**
-
-```javascript
-// Token is saved in localStorage
-localStorage.getItem("token")  
-// → "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...."
-
-// And in React state (AuthContext)
-const { token } = useAuth()
-// → "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...."
-
-// Then redirected to /employees
 ```
 
 ---
 
-## 📋 GET /employees - Protected Request with Token
+### **RETURN: Database → Backend → User**
 
-### Why the user sends this request
+#### 7. Repository receives data from MongoDB
 
-After login, user is redirected to employees page. The page needs to fetch all employees. Token is automatically sent via axios interceptor.
+```python
+# MongoDB connection responds with user document
+# Motor async driver converts MongoDB cursor to Python dict
+user_data = await self.collection.find_one({"email": email})
+# Returns: {"_id": ObjectId(...), "email": "admin@...", "hashed_password": "...", ...}
 
-### Frontend: Fetch employees page loads
+# STEP 7: Repository transforms to UserInDB Pydantic model
+return UserInDB(**user_data)  # Returns to Controller
+```
 
-**File:** `frontend/src/pages/EmployeesList.tsx`
+#### 8. Controller receives repository result
 
-```typescript
-import { useEmployees } from '../hooks/useEmployees'
+```python
+# Repository returned UserInDB object with user data
+user = await self.user_repo.find_user_by_email(payload.email)
+# user = UserInDB(id="507f...", email="admin@...", role="admin", ...)
 
-function EmployeesList() {
-    // Hook fetches ALL employees in 1 API call
-    const { data: employees, query, setQuery, refetch } = useEmployees()
+# Controller verifies password
+if not verify_password(payload.password, user.hashed_password):
+    # Password matches! Continue...
+    
+# Create JWT token
+token = create_access_token(email=user.email, role=user.role)
 
-    return (
-        <>
-            <h2>Employees</h2>
-            <input 
-                type="text" 
-                placeholder="Search..." 
-                value={query} 
-                onChange={e => setQuery(e.target.value)}
-            />
-            <table>
-                <tbody>
-                    {employees.map(emp => (
-                        <tr key={emp.employee_id}>
-                            <td>{emp.name}</td>
-                            <td>{emp.department}</td>
-                        </tr>
-                    ))}
-                </tbody>
-            </table>
-        </>
-    )
+# STEP 8: Return LoginResponse object to Router
+return LoginResponse(
+    access_token="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBjb21wYW55...",
+    token_type="bearer"
+)
+```
+
+#### 9. Router receives response from Controller
+
+```python
+# Controller returned LoginResponse object
+# FastAPI automatically:
+# 1. Validates response matches LoginResponse model
+# 2. Serializes to JSON
+# 3. Sets HTTP status code (200 OK)
+# 4. Sets Content-Type header
+
+# STEP 9: FastAPI returns to client
+return LoginResponse(...)  # FastAPI converts to JSON
+```
+
+#### 10. HTTP Response sent to browser
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Date: Wed, 22 May 2026 15:30:00 GMT
+
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBjb21wYW55LmNvbSIsInJvbGUiOiJhZG1pbiIsImlhdCI6MTcxNjQwMjIwMCwiZXhwIjoxNzE2NDA0MDAwfQ.abcdef123456...",
+  "token_type": "bearer"
 }
 ```
 
-**File:** `frontend/src/hooks/useEmployees.ts`
-
-```typescript
-import { useEffect, useState, useMemo } from 'react'
-import { EmployeeService } from '../services/employeeService'
-
-export function useEmployees() {
-    const [all, setAll] = useState([])
-    const [query, setQuery] = useState('')
-
-    useEffect(() => {
-        // On component mount: fetch all employees from API
-        const refetch = async () => {
-            const data = await EmployeeService.list()
-            setAll(data)
-        }
-        refetch()
-    }, [])
-
-    // Client-side filtering: instant, no API calls
-    const data = useMemo(() => {
-        const q = query.trim().toLowerCase()
-        if (!q) return all
-        return all.filter(e => 
-            e.name.toLowerCase().includes(q) ||
-            e.department.toLowerCase().includes(q)
-        )
-    }, [all, query])
-
-    return { data, query, setQuery }
-}
-```
-
-**File:** `frontend/src/services/employeeService.ts`
-
-```typescript
-import api from '../api/axios'
-
-export const EmployeeService = {
-    // GET /employees - fetch all employees
-    list: (): Promise<Employee[]> =>
-        api.get<Employee[]>('/employees').then(r => r.data)
-}
-```
-
-### Frontend: Axios interceptor adds token to request
+#### 11. Axios receives HTTP response
 
 **File:** `frontend/src/api/axios.ts`
 
 ```typescript
-import axios from 'axios'
+// Axios gets 200 response
+api.post('/auth/login', { email, password })
+    .then(response => {
+        // STEP 11: Response interceptor checks status
+        // Status 200 = success, pass through
+        return response
+    })
+```
 
-const api = axios.create({
-    baseURL: import.meta.env.VITE_API_URL || 'http://localhost:8000'
-})
+#### 12. Frontend component receives data
 
-// REQUEST INTERCEPTOR: Before every request, add JWT token from localStorage
-api.interceptors.request.use((config) => {
-    // Read token from localStorage (was saved after login)
-    const token = localStorage.getItem('token')
+```tsx
+// AuthService.login() promise resolves
+const data = await AuthService.login(email, password)
+
+// STEP 12: data contains:
+// {
+//   access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+//   token_type: "bearer"
+// }
+```
+
+#### 13. Frontend stores token in LocalStorage
+
+**File:** `frontend/src/context/AuthContext.tsx`
+
+```tsx
+// Login page received the response data
+const data = await AuthService.login(email, password)
+
+// STEP 13a: Call AuthContext.login() to store token
+login(data.access_token)
+
+// AuthContext implementation:
+const login = (newToken: string) => {
+    // Save to localStorage (persists across page refreshes)
+    localStorage.setItem('token', newToken)
     
-    // Add to Authorization header in Bearer format
+    // Save to React state (immediate UI update)
+    setToken(newToken)
+}
+```
+
+#### 14. Frontend redirects user to employees page
+
+```tsx
+// Token is stored, now redirect
+navigate('/employees')
+
+// Browser navigates to new URL: http://localhost:5173/employees
+```
+
+#### 15. Frontend renders login success (UI updates)
+
+```tsx
+// Login.tsx component:
+// - login() succeeded → no error shown
+// - navigate() executed → page redirects
+// - User sees "Loading employees..." on new page
+
+// User is now authenticated ✅
+```
+
+---
+
+## 📋 GET /employees - Protected Request (Return Path Detailed)
+
+### **OUTGOING: User's browser → Backend → Database**
+
+#### 1. Frontend: Employee page mounts
+
+```tsx
+function EmployeesList() {
+    const { data: employees } = useEmployees()  // Hook runs on mount
+}
+```
+
+#### 2. Hook calls EmployeeService
+
+```typescript
+// useEmployees hook:
+useEffect(() => {
+    const refetch = async () => {
+        // STEP 1: Call API
+        const data = await EmployeeService.list()
+        setAll(data)
+    }
+    refetch()
+}, [])
+```
+
+#### 3. Axios interceptor adds token to request
+
+**File:** `frontend/src/api/axios.ts`
+
+```typescript
+api.interceptors.request.use((config) => {
+    // STEP 2: Before sending request, read token from localStorage
+    const token = localStorage.getItem('token')
+    // token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    
+    // Add Authorization header
     if (token) {
         config.headers['Authorization'] = `Bearer ${token}`
     }
     
-    return config
+    return config  // Request now has Authorization header
 })
-
-// RESPONSE INTERCEPTOR: If token expired (401), remove it
-api.interceptors.response.use(
-    response => response,
-    error => {
-        if (error.response?.status === 401) {
-            localStorage.removeItem('token')
-            window.location.href = '/login'
-        }
-        return Promise.reject(error)
-    }
-)
-
-export default api
 ```
 
-**HTTP Request sent (via interceptor):**
+#### 4. HTTP request sent with token
 
 ```http
 GET http://localhost:8000/employees
 Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhZG1pbkBjb21wYW55LmNvbSIsInJvbGUiOiJhZG1pbiJ9...
-Content-Type: application/json
+Accept: application/json
 ```
 
-### Backend: Router validates authentication
-
-**File:** `backend/app/router/employees.py`
-
-```python
-from fastapi import APIRouter, Depends, status
-from app.dependencies.users import get_current_user, required_role
-
-# All employees routes require a valid JWT token via get_current_user
-# This is applied globally to the router
-router = APIRouter(
-    prefix="/employees",
-    tags=["employees"],
-    dependencies=[Depends(get_current_user)]  # ← Required for ALL routes
-)
-
-@router.get("", response_model=List[EmployeeResponse])
-async def get_all_employees(
-    controller: EmployeeController = Depends(get_employee_controller)
-) -> List[EmployeeResponse]:
-    """
-    Fetch all employees.
-    
-    Before this function runs:
-    1. Dependency get_current_user runs
-    2. Extracts & validates JWT from Authorization header
-    3. Returns authenticated user
-    4. Only then does this endpoint execute
-    """
-    return await controller.get_all_employees()
-```
-
-### Backend: Dependency validates JWT token
+#### 5. Backend dependency validates token
 
 **File:** `backend/app/dependencies/users.py`
 
 ```python
-from fastapi import Depends, HTTPException, Request
-from jose import JWTError, jwt
-from app.auth.utils import decode_access_token
-
-_CREDENTIAL_EXCEPTION = HTTPException(
-    status_code=401,
-    detail="Invalid credentials or missing token",
-    headers={"WWW-Authenticate": "Bearer"}
-)
-
-async def get_current_user(
-    request: Request,
-    user_repo: UserRepository = Depends(get_user_repository)
-) -> UserInDB:
-    """
-    Validate JWT token from Authorization header.
-    
-    This dependency is called BEFORE the endpoint function runs.
-    If token is invalid → raises 401 → endpoint never executes.
-    If valid → returns authenticated user → endpoint executes.
-    """
-    
-    # STEP 1: Extract Bearer token from Authorization header
+async def get_current_user(request: Request, user_repo: UserRepository = Depends(...)):
+    # STEP 3: Extract Bearer token from Authorization header
     auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise _CREDENTIAL_EXCEPTION
+    # auth_header = "Bearer eyJhbGciOi..."
     
-    # STEP 2: Parse token from "Bearer <token>"
     token = auth_header.split(" ")[1]
+    # token = "eyJhbGciOi..."
     
-    try:
-        # STEP 3: Decode JWT and verify signature
-        # If signature invalid or expired → JWTError → 401
-        payload = decode_access_token(token)
-        email = payload.get("sub")
-        
-        if email is None:
-            raise _CREDENTIAL_EXCEPTION
-        
-        # STEP 4: Ensure user still exists in database
-        # (user might have been deleted after token was issued)
-        user = await user_repo.find_user_by_email(email)
-        if user is None:
-            raise _CREDENTIAL_EXCEPTION
-        
-        # STEP 5: Return authenticated user (passed to endpoint)
-        return user
-        
-    except JWTError:
-        raise _CREDENTIAL_EXCEPTION
-```
-
-**File:** `backend/app/auth/utils.py`
-
-```python
-from jose import jwt
-from app.core.settings import settings
-
-def decode_access_token(token: str) -> dict:
-    """
-    Decode and verify JWT signature.
+    # Decode and verify JWT signature
+    payload = decode_access_token(token)
+    # payload = {"sub": "admin@company.com", "role": "admin", "exp": ..., "iat": ...}
     
-    If signature invalid, tampered, or expired → raises JWTError
-    """
-    return jwt.decode(
-        token,
-        settings.JWT_SECRET_KEY,
-        algorithms=[settings.JWT_ALGORITHM]  # HS256
-    )
+    email = payload.get("sub")  # "admin@company.com"
+    
+    # Ensure user still exists in database
+    user = await user_repo.find_user_by_email(email)
+    
+    # Returns authenticated user to route handler
+    return user  # Passes to next layer
 ```
 
-### Backend: Controller fetches employees
-
-**File:** `backend/app/controller/employees.py`
+#### 6. Router receives authentication, calls controller
 
 ```python
-from app.repository.employees import EmployeeRepository
-from app.models.employees import EmployeeResponse
-
-class EmployeeController:
-    def __init__(self, repository: EmployeeRepository):
-        self.repository = repository
-
-    async def get_all_employees(self) -> List[EmployeeResponse]:
-        """
-        Fetch all employees from database via repository.
-        
-        At this point, we know the request is authenticated
-        (dependency get_current_user already validated JWT).
-        """
-        # Call repository to fetch from database
-        employees = await self.repository.get_all_employees()
-        
-        # Convert to response model (safe schema)
-        return [EmployeeResponse(**emp) for emp in employees]
+@router.get("", response_model=List[EmployeeResponse])
+async def get_all_employees(
+    controller: EmployeeController = Depends(get_employee_controller)
+) -> List[EmployeeResponse]:
+    # STEP 4: get_current_user already validated token
+    # This function only runs if authentication passed
+    # (If token invalid, dependency raises 401 and this function never runs)
+    
+    return await controller.get_all_employees()
 ```
 
-### Backend: Repository queries MongoDB
-
-**File:** `backend/app/repository/employees.py`
+#### 7. Controller calls repository
 
 ```python
-from motor.motor_asyncio import AsyncIOMotorDatabase
-import datetime
-
-class EmployeeRepository:
-    def __init__(self, db: AsyncIOMotorDatabase):
-        self.db = db
-
-    async def get_all_employees(self) -> list:
-        """
-        Query MongoDB employees collection for all documents.
-        
-        Returns all employee documents in the collection.
-        """
-        # MongoDB query: db.employees.find({})
-        cursor = self.db.employees.find()
-        
-        # Collect all documents from cursor
-        employees = []
-        async for employee in cursor:
-            # Convert MongoDB _id to string
-            employee["id"] = str(employee["_id"])
-            employees.append(employee)
-        
-        return employees
+async def get_all_employees(self):
+    # STEP 5: Query repository for all employees
+    employees = await self.repository.get_all_employees()
+    
+    # Convert to response models
+    return [EmployeeResponse(**emp) for emp in employees]
 ```
 
-### MongoDB: Query executes
+#### 8. Repository queries MongoDB
+
+```python
+async def get_all_employees(self) -> list:
+    # STEP 6: Query MongoDB
+    cursor = self.db.employees.find()
+    
+    # Collect documents
+    employees = []
+    async for employee in cursor:
+        employees.append(employee)
+    
+    return employees
+```
+
+#### 9. MongoDB returns documents
 
 ```javascript
 // MongoDB query
 db.employees.find({})
 
-// Returns all documents:
+// Returns all employee documents
 [
   {
     "_id": ObjectId("507f1f77bcf86cd799439011"),
@@ -752,13 +404,67 @@ db.employees.find({})
 ]
 ```
 
-### Backend: Response returns to frontend
+---
 
-**HTTP Response:**
+### **RETURN: Database → Backend → Axios → Frontend → User's Screen**
+
+#### 10. Repository receives MongoDB documents
+
+```python
+async def get_all_employees(self):
+    cursor = self.db.employees.find()
+    
+    # STEP 7: Motor async driver returns documents
+    employees = []
+    async for employee in cursor:
+        # employee is a dict from MongoDB
+        # {"_id": ObjectId(...), "employee_id": "EMP00001", ...}
+        employees.append(employee)
+    
+    # STEP 8: Return list to Controller
+    return employees  # [dict, dict, dict, ...]
+```
+
+#### 11. Controller receives list from repository
+
+```python
+async def get_all_employees(self):
+    # Repository returned list of dicts
+    employees = await self.repository.get_all_employees()
+    # employees = [{"_id": ObjectId(...), "employee_id": "EMP00001", ...}, ...]
+    
+    # STEP 9: Transform to response models
+    response_models = [EmployeeResponse(**emp) for emp in employees]
+    # response_models = [EmployeeResponse(employee_id="EMP00001", name="John Doe", ...), ...]
+    
+    # STEP 10: Return to Router
+    return response_models
+```
+
+#### 12. Router receives response from controller
+
+```python
+@router.get("", response_model=List[EmployeeResponse])
+async def get_all_employees(controller: EmployeeController = Depends(...)):
+    # Controller returned list of EmployeeResponse objects
+    result = await controller.get_all_employees()
+    # result = [EmployeeResponse(...), EmployeeResponse(...), ...]
+    
+    # STEP 11: FastAPI automatically:
+    # 1. Validates result matches List[EmployeeResponse] model
+    # 2. Serializes each object to JSON dict
+    # 3. Sets HTTP status 200 OK
+    
+    return result
+```
+
+#### 13. HTTP response built and sent to browser
 
 ```http
 HTTP/1.1 200 OK
 Content-Type: application/json
+Date: Wed, 22 May 2026 15:35:00 GMT
+Content-Length: 1247
 
 [
   {
@@ -784,247 +490,122 @@ Content-Type: application/json
 ]
 ```
 
-### Frontend: Render employees
-
-The useEmployees hook stores the response in state, and the component renders them in a table. User can search client-side (instant, no API calls).
-
----
-
-## ✍️ Complete Register Flow
-
-### Why the user sends this request
-
-User does not yet have an account, so they send email + password to create one.
-
-### Frontend: Register component
-
-**File:** `frontend/src/pages/Register.tsx`
-
-```tsx
-import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { AuthService } from '../services/authService'
-
-function Register() {
-    const [email, setEmail] = useState('')
-    const [password, setPassword] = useState('')
-    const [error, setError] = useState('')
-    const navigate = useNavigate()
-
-    const handleSubmit = async (e: React.FormEvent) => {
-        e.preventDefault()
-        try {
-            // Call backend to register
-            await AuthService.register(email, password)
-            
-            // On success, redirect to login (user needs to authenticate)
-            navigate('/login')
-        } catch (err: any) {
-            // Show error: "User with this email already exists" or validation error
-            setError(err?.response?.data?.detail ?? 'Failed to register')
-        }
-    }
-
-    return (
-        <form onSubmit={handleSubmit}>
-            <input 
-                type="email" 
-                value={email} 
-                onChange={e => setEmail(e.target.value)}
-                placeholder="Email"
-            />
-            <input 
-                type="password" 
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                placeholder="Password"
-            />
-            <button type="submit">Create Account</button>
-            {error && <p style={{color: 'red'}}>{error}</p>}
-        </form>
-    )
-}
-```
-
-### Frontend: API call via AuthService
+#### 14. Axios receives response
 
 ```typescript
-export const AuthService = {
-    register: (email: string, password: string): Promise<UserResponse> => {
-        return api.post<UserResponse>('/auth/register', { email, password })
-            .then(r => r.data)
+api.interceptors.response.use(
+    (response) => {
+        // STEP 12: Response interceptor receives 200 OK
+        // response.status = 200
+        // response.data = [employee objects]
+        
+        // Response is valid, pass it through
+        return response
     }
-}
-```
-
-**HTTP Request:**
-
-```http
-POST http://localhost:8000/auth/register
-Content-Type: application/json
-
-{
-  "email": "newuser@company.com",
-  "password": "secure123"
-}
-```
-
-### Backend: Router and Controller
-
-**Router validation:**
-
-```python
-@router.post(
-    "/register",
-    status_code=status.HTTP_201_CREATED,
-    response_model=UserResponse
 )
-async def register_user(
-    payload: UserCreate,  # ← Validated by Pydantic
-    controller: AuthController = Depends(get_auth_controller)
-) -> UserResponse:
-    return await controller.register_user(payload)
 ```
 
-**Controller logic:**
+#### 15. Frontend promise resolves with data
 
-```python
-async def register_user(self, payload: UserCreate) -> UserResponse:
-    """
-    Register a new user account.
+```typescript
+// useEmployees hook:
+const refetch = async () => {
+    // API call completes
+    const data = await EmployeeService.list()
     
-    1. Check if email already exists (409 if duplicate)
-    2. Hash password
-    3. Create user document
-    4. Insert into database
-    """
+    // STEP 13: data contains employee array
+    // data = [
+    //   {employee_id: "EMP00001", name: "John Doe", ...},
+    //   {employee_id: "EMP00002", name: "Jane Smith", ...}
+    // ]
     
-    # STEP 1: Fast fail if email already registered
-    existing_user = await self.user_repo.find_user_by_email(payload.email)
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="User with this email already exists"
-        )
+    // STEP 14: Store in React state
+    setAll(data)
+}
+```
+
+#### 16. React re-renders with employee data
+
+```tsx
+function EmployeesList() {
+    // State updated with employees
+    const { data: employees } = useEmployees()
+    // employees = [
+    //   {employee_id: "EMP00001", name: "John Doe", ...},
+    //   {employee_id: "EMP00002", name: "Jane Smith", ...}
+    // ]
     
-    # STEP 2: Hash password (never store plain text)
-    hashed_password = hash_password(payload.password)
-    
-    # STEP 3: Create user document with default role "user"
-    user = UserInDB(
-        email=payload.email,
-        hashed_password=hashed_password,
-        role="user",  # New users always get "user" role (not admin)
-        activity_logs=[
-            ActivityLogEntry(action="register", timestamp=datetime.now(timezone.utc))
-        ]
+    // STEP 15: Component re-renders
+    return (
+        <table>
+            <tbody>
+                {employees.map(emp => (  // STEP 16: Map over employees
+                    <tr key={emp.employee_id}>
+                        <td>{emp.employee_id}</td>
+                        <td>{emp.name}</td>
+                        <td>{emp.email}</td>
+                        <td>{emp.department}</td>
+                        <td>{emp.position}</td>
+                        <td>{emp.status}</td>
+                    </tr>
+                ))}
+            </tbody>
+        </table>
     )
-    
-    # STEP 4: Insert into database via repository
-    user_id = await self.user_repo.create_user(user)
-    
-    if not user_id:
-        # Race condition: email was registered between check and insert
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="User with this email already exists"
-        )
-    
-    # STEP 5: Return safe response (no password exposed!)
-    return UserResponse(id=user_id, email=user.email, role=user.role)
-```
-
-### Backend: Repository inserts user
-
-**File:** `backend/app/repository/users.py`
-
-```python
-from pymongo.errors import DuplicateKeyError
-
-async def create_user(self, user: UserInDB) -> str:
-    """
-    Insert new user document into MongoDB users collection.
-    
-    Returns: MongoDB generated _id (as string)
-    Raises: DuplicateKeyError if email already exists (unique index)
-    """
-    
-    try:
-        # MongoDB insert: db.users.insertOne(user_document)
-        result = await self.collection.insert_one(
-            user.model_dump(exclude={"id"})  # Don't send id field, let MongoDB generate
-        )
-        
-        # Return the MongoDB-generated ObjectId as string
-        return str(result.inserted_id)
-        
-    except DuplicateKeyError:
-        # Unique index violation: email already exists
-        # Repository returns None to indicate failure
-        return None
-```
-
-### MongoDB: User document inserted
-
-```javascript
-// MongoDB insert operation
-db.users.insertOne({
-  email: "newuser@company.com",
-  hashed_password: "$argon2id$v=19$m=65540,t=3,p=4$...base64hash...",
-  role: "user",
-  activity_log: [
-    {
-      action: "register",
-      timestamp: ISODate("2026-05-22T15:00:00Z")
-    }
-  ]
-})
-
-// Returns
-{
-  acknowledged: true,
-  insertedId: ObjectId("507f1f77bcf86cd799439050")
-}
-
-// Collection now has unique index on email:
-db.users.getIndexes()
-// [
-//   { key: { _id: 1 } },
-//   { key: { email: 1 }, unique: true, name: "uq_email_index" }
-// ]
-```
-
-### Backend: Response returns
-
-**HTTP Response:**
-
-```http
-HTTP/1.1 201 Created
-Content-Type: application/json
-
-{
-  "id": "507f1f77bcf86cd799439050",
-  "email": "newuser@company.com",
-  "role": "user"
 }
 ```
 
-### Frontend: Redirect to login
+#### 17. Browser renders HTML table on user's screen
 
-After successful 201 registration response, frontend redirects to /login page so user can authenticate.
+```
+┌─────────────────────────────────────────────────────┐
+│ Employee Management                                  │
+├──────────────┬──────────────┬──────────────────────┤
+│ Employee ID  │ Name         │ Department           │
+├──────────────┼──────────────┼──────────────────────┤
+│ EMP00001     │ John Doe     │ IT                   │
+│ EMP00002     │ Jane Smith   │ HR                   │
+└──────────────┴──────────────┴──────────────────────┘
+
+✅ USER CAN NOW SEE EMPLOYEES ON SCREEN
+```
 
 ---
 
-## Summary: Why Each Layer Exists
+## Summary: Complete Round-Trip Journey
 
-| Layer | Why |
-|-------|-----|
-| **Frontend Component** | User interface - collect input, show results |
-| **Frontend Service** | Encapsulate API calls - reusable across components |
-| **Axios Interceptor** | Auto-add token to every request, handle 401 responses |
-| **Router** | HTTP validation, dependency injection setup |
-| **Controller** | Business logic - passwords, tokens, authorization |
-| **Repository** | Database queries - CRUD operations only |
-| **MongoDB** | Persistent data storage, indexes, unique constraints |
+```
+USER'S BROWSER
+    ↓
+    └→ Frontend Component (Login.tsx)
+         └→ AuthService.login(email, password)
+              └→ Axios HTTP Request
+                   └→ NETWORK (internet)
+                        └→ Backend Router (/auth/login)
+                             └→ Controller.login_user()
+                                  └→ Repository.find_user_by_email()
+                                       └→ MONGODB query
+                                            └→ Database returns document
+                                                 └→ Repository returns UserInDB
+                                                      └→ Controller creates JWT
+                                                           └→ Router returns LoginResponse
+                                                                └→ FastAPI serializes to JSON
+                                                                     └→ HTTP 200 Response
+                                                                          └→ NETWORK (internet)
+                                                                               └→ Axios interceptor
+                                                                                    └→ Frontend promise resolves
+                                                                                         └→ AuthContext stores token
+                                                                                              └→ React state updates
+                                                                                                   └→ Navigate to /employees
+                                                                                                        └→ useEmployees hook
+                                                                                                             └→ API request with token
+                                                                                                                  └→ [SAME JOURNEY ABOVE]
+                                                                                                                       └→ Data received
+                                                                                                                            └→ setAll(employees)
+                                                                                                                                 └→ Component re-renders
+                                                                                                                                      └→ Browser renders HTML table
+                                                                                                                                           ↓
+                                                                                                                                    USER'S SCREEN ✅
+```
 
-Each layer has one responsibility. Testable in isolation. Easy to modify without affecting others.
+**Every response takes the SAME PATH BACK as the request came, but in reverse!**
